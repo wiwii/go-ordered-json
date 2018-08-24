@@ -19,6 +19,7 @@ import (
 	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
+	"log"
 )
 
 // Unmarshal parses the JSON-encoded data and stores the result
@@ -382,6 +383,7 @@ var (
 // It updates d.off to point past the decoded value. If v is
 // invalid, the JSON value is discarded.
 func (d *decodeState) value(v reflect.Value) {
+	log.Printf("v=[%v]\n", v)
 	switch op := d.scanWhile(scanSkipSpace); op {
 	default:
 		d.error(errPhase)
@@ -640,6 +642,29 @@ func (d *decodeState) object(v reflect.Value) {
 			v.Set(reflect.MakeMap(t))
 		}
 	case reflect.Struct:
+		if v.Type().String() == "json.SimMap" {
+			log.Printf("v.Type()=[%v]\n", v.Type())
+			_t, _ := v.Type().FieldByName("Data")
+			t := _t.Type
+			log.Printf("t=[%v]\nvalue=[%v]\nt.Key().Kind()=[%v]\nt=[%v]\n", _t, reflect.ValueOf(_t), t.Key().Kind(), _t.Type)
+			//switch t.Key().Kind() {
+			//case reflect.String,
+			//	reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			//	reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			//default:
+			//	if !reflect.PtrTo(t.Key()).Implements(textUnmarshalerType) {
+			//		d.saveError(&UnmarshalTypeError{Value: "object", Type: v.Type(), Offset: int64(d.off)})
+			//		d.off--
+			//		d.next() // skip over { } in input
+			//		return
+			//	}
+			//}
+			simMapInstance := SimMap{}
+			v.Set(reflect.ValueOf(simMapInstance))
+			log.Printf("kind=[%v]\n_t2=[%v]\n", v.FieldByName("Data").Kind(), reflect.TypeOf(simMapInstance.Data))
+			v.FieldByName("Data").Set(reflect.MakeMap(reflect.TypeOf(simMapInstance.Data)))
+			log.Printf("v=[%v]\n", v)
+		}
 		// ok
 	default:
 		d.saveError(&UnmarshalTypeError{Value: "object", Type: v.Type(), Offset: int64(d.off)})
@@ -680,6 +705,18 @@ func (d *decodeState) object(v reflect.Value) {
 				mapElem = reflect.New(elemType).Elem()
 			} else {
 				mapElem.Set(reflect.Zero(elemType))
+			}
+			subv = mapElem
+		} else if v.Kind() == reflect.Struct && v.Type().String() == "json.SimMap" {
+			_t, _ := v.Type().FieldByName("Data")
+			elemType := _t.Type.Elem()
+			log.Printf("elemType=[%v]\n", elemType)
+			if !mapElem.IsValid() {
+				mapElem = reflect.New(elemType).Elem()
+				log.Printf("mapElem=[%v]\n", mapElem)
+			} else {
+				mapElem.Set(reflect.Zero(elemType))
+				log.Printf("mapElem=[%v]\n", mapElem)
 			}
 			subv = mapElem
 		} else {
@@ -733,6 +770,7 @@ func (d *decodeState) object(v reflect.Value) {
 			d.value(subv)
 		}
 
+
 		// Write value back to map;
 		// if using struct, subv points into struct already.
 		if v.Kind() == reflect.Map {
@@ -767,7 +805,54 @@ func (d *decodeState) object(v reflect.Value) {
 					panic("json: Unexpected key type") // should never occur
 				}
 			}
+			log.Printf("SetMapIndex|v=[%v]\n|kv=[%v]|subv=[%v]\n", v, kv, subv)
 			v.SetMapIndex(kv, subv)
+		} else if v.Kind() == reflect.Struct && v.Type().String() == "json.SimMap" {
+			log.Printf("v.Type()=[%v]\n", v.Type())
+			_kt, _ := v.Type().FieldByName("Data")
+			log.Printf("kt=[%v]\nvalue=[%v]\n", _kt, _kt.Type)
+			var kv reflect.Value
+			if _kt.Type.Kind() == reflect.Map {
+				log.Printf("_kt is map\n")
+				kt := _kt.Type.Key()
+				switch {
+				case kt.Kind() == reflect.String:
+					kv = reflect.ValueOf(key).Convert(kt)
+				case reflect.PtrTo(kt).Implements(textUnmarshalerType):
+					kv = reflect.New(v.Type().Key())
+					d.literalStore(item, kv, true)
+					kv = kv.Elem()
+				default:
+					switch kt.Kind() {
+					case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+						s := string(key)
+						n, err := strconv.ParseInt(s, 10, 64)
+						if err != nil || reflect.Zero(kt).OverflowInt(n) {
+							d.saveError(&UnmarshalTypeError{Value: "number " + s, Type: kt, Offset: int64(start + 1)})
+							return
+						}
+						kv = reflect.ValueOf(n).Convert(kt)
+					case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+						s := string(key)
+						n, err := strconv.ParseUint(s, 10, 64)
+						if err != nil || reflect.Zero(kt).OverflowUint(n) {
+							d.saveError(&UnmarshalTypeError{Value: "number " + s, Type: kt, Offset: int64(start + 1)})
+							return
+						}
+						kv = reflect.ValueOf(n).Convert(kt)
+					default:
+						panic("json: Unexpected key type") // should never occur
+					}
+				}
+				log.Printf("SetMapIndex|kv=[%v]|subv=[%v]\n", kv, subv)
+				keyList := v.FieldByName("KeySlice")
+				_kt2 := v.FieldByName("Data")
+				log.Printf("_kt.kind=[%v]\n_kt2=[%v]\n", _kt.Type.Kind(), _kt2)
+				_kt2.SetMapIndex(kv, subv)
+				keyList.Set(reflect.ValueOf(append(keyList.Interface().([]string), kv.String())))
+				v.FieldByName("Data").Set(_kt2)
+				v.FieldByName("KeySlice").Set(keyList)
+			}
 		}
 
 		// Next token must be , or }.

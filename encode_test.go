@@ -920,3 +920,26 @@ func TestEncodeOrderedObject(t *testing.T) {
 		}
 	}
 }
+
+func TestMarshal2(t *testing.T) {
+	log.SetFlags(log.Lshortfile | log.LstdFlags)
+	a := SimMap{}
+	out := Unmarshal([]byte(`{"msg":"Success","code":"10000","sub_merchant_id":"2088231448140708"}`), &a)
+	out2, err := Marshal(a)
+	fmt.Printf("out=[%v]\na=[%v]\n", out, a)
+	fmt.Printf("out2=[%v]\nerr=[%v]\n", string(out2), err)
+}
+
+func TestMarshal3(t *testing.T) {
+	log.SetFlags(log.Lshortfile | log.LstdFlags)
+	ma := map[string]interface{}{
+		"a": 1,
+		"b": "2",
+	}
+	s1 := SimMap{
+		Data: ma,
+		KeySlice: []string{},
+	}
+
+	log.Printf("v=[%v]\n", reflect.ValueOf(s1).FieldByName("Data"))
+}
