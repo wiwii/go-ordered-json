@@ -27,6 +27,7 @@ import (
 	"unicode/utf8"
 	// new in golang 1.9
 	"golang.org/x/sync/syncmap"
+	"log"
 )
 
 // Marshal returns the JSON encoding of v.
@@ -343,7 +344,37 @@ func valueEncoder(v reflect.Value) encoderFunc {
 	if !v.IsValid() {
 		return invalidValueEncoder
 	}
-	return typeEncoder(v.Type())
+	return typeEncoderWithValue(v)
+}
+
+func typeEncoderWithValue(_t reflect.Value) encoderFunc {
+	t := _t.Type()
+	if fi, ok := encoderCache.Load(t); ok {
+		return fi.(encoderFunc)
+	}
+
+	// To deal with recursive types, populate the map with an
+	// indirect func before we build it. This type waits on the
+	// real func (f) to be ready and then calls it. This indirect
+	// func is only used for recursive types.
+	var (
+		wg sync.WaitGroup
+		f  encoderFunc
+	)
+	wg.Add(1)
+	fi, loaded := encoderCache.LoadOrStore(t, encoderFunc(func(e *encodeState, v reflect.Value, opts encOpts) {
+		wg.Wait()
+		f(e, v, opts)
+	}))
+	if loaded {
+		return fi.(encoderFunc)
+	}
+
+	// Compute the real encoder and replace the indirect func with it.
+	f = newTypeEncoderWithValue(_t, true)
+	wg.Done()
+	encoderCache.Store(t, f)
+	return f
 }
 
 func typeEncoder(t reflect.Type) encoderFunc {
@@ -422,6 +453,63 @@ func newTypeEncoder(t reflect.Type, allowAddr bool) encoderFunc {
 	case reflect.Interface:
 		return interfaceEncoder
 	case reflect.Struct:
+		return newStructEncoder(t)
+	case reflect.Map:
+		return newMapEncoder(t)
+	case reflect.Slice:
+		return newSliceEncoder(t)
+	case reflect.Array:
+		return newArrayEncoder(t)
+	case reflect.Ptr:
+		return newPtrEncoder(t)
+	default:
+		return unsupportedTypeEncoder
+	}
+}
+
+func newTypeEncoderWithValue(_t reflect.Value, allowAddr bool) encoderFunc {
+	t := _t.Type()
+	if t.Implements(marshalerType) {
+		return marshalerEncoder
+	}
+	if t.Kind() != reflect.Ptr && allowAddr {
+		if reflect.PtrTo(t).Implements(marshalerType) {
+			return newCondAddrEncoder(addrMarshalerEncoder, newTypeEncoderWithValue(_t, false))
+		}
+	}
+
+	if t.Implements(textMarshalerType) {
+		return textMarshalerEncoder
+	}
+	if t.Kind() != reflect.Ptr && allowAddr {
+		if reflect.PtrTo(t).Implements(textMarshalerType) {
+			return newCondAddrEncoder(addrTextMarshalerEncoder, newTypeEncoderWithValue(_t, false))
+		}
+	}
+
+	if t == orderedObjectType {
+		return orderedObjectEncoder
+	}
+
+	switch t.Kind() {
+	case reflect.Bool:
+		return boolEncoder
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return intEncoder
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return uintEncoder
+	case reflect.Float32:
+		return float32Encoder
+	case reflect.Float64:
+		return float64Encoder
+	case reflect.String:
+		return stringEncoder
+	case reflect.Interface:
+		return interfaceEncoder
+	case reflect.Struct:
+		if t.String() == "json.SimMap" {
+			return newSimMapStructEncoder(_t)
+		}
 		return newStructEncoder(t)
 	case reflect.Map:
 		return newMapEncoder(t)
@@ -632,19 +720,35 @@ func (se *structEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	e.WriteByte('{')
 	first := true
 	for i, f := range se.fields {
-		fv := fieldByIndex(v, f.index)
-		if !fv.IsValid() || f.omitEmpty && isEmptyValue(fv) {
-			continue
-		}
-		if first {
-			first = false
+		if v.Type().String() == "json.SimMap" {
+			fv := fieldByIndex2(v.FieldByName("Data"), f.name)
+			if !fv.IsValid() || f.omitEmpty && isEmptyValue(fv) {
+				continue
+			}
+			if first {
+				first = false
+			} else {
+				e.WriteByte(',')
+			}
+			e.string(f.name, opts.escapeHTML)
+			e.WriteByte(':')
+			opts.quoted = f.quoted
+			se.fieldEncs[i](e, fv, opts)
 		} else {
-			e.WriteByte(',')
+			fv := fieldByIndex(v, f.index)
+			if !fv.IsValid() || f.omitEmpty && isEmptyValue(fv) {
+				continue
+			}
+			if first {
+				first = false
+			} else {
+				e.WriteByte(',')
+			}
+			e.string(f.name, opts.escapeHTML)
+			e.WriteByte(':')
+			opts.quoted = f.quoted
+			se.fieldEncs[i](e, fv, opts)
 		}
-		e.string(f.name, opts.escapeHTML)
-		e.WriteByte(':')
-		opts.quoted = f.quoted
-		se.fieldEncs[i](e, fv, opts)
 	}
 	e.WriteByte('}')
 }
@@ -657,6 +761,19 @@ func newStructEncoder(t reflect.Type) encoderFunc {
 	}
 	for i, f := range fields {
 		se.fieldEncs[i] = typeEncoder(typeByIndex(t, f.index))
+	}
+	return se.encode
+}
+
+func newSimMapStructEncoder(_t reflect.Value) encoderFunc {
+	fields := cachedTypeFieldsWithValue(_t)
+	se := &structEncoder{
+		fields:    fields,
+		fieldEncs: make([]encoderFunc, len(fields)),
+	}
+	for i, f := range fields {
+		//log.Printf("i=[%v]|f=[%v]\n_t=[%v]\nkeySlice=[%v]\n", i, f, _t, _t.FieldByName("KeySlice"))
+		se.fieldEncs[i] = typeEncoderWithValue(reflect.ValueOf(_t.FieldByName("KeySlice").Interface().([]string)[f.index[0]]))
 	}
 	return se.encode
 }
@@ -860,6 +977,9 @@ func fieldByIndex(v reflect.Value, index []int) reflect.Value {
 		v = v.Field(i)
 	}
 	return v
+}
+func fieldByIndex2(v reflect.Value, index string) reflect.Value {
+	return reflect.ValueOf(v.Interface().(map[string]interface{})[index])
 }
 
 func typeByIndex(t reflect.Type, index []int) reflect.Type {
@@ -1235,6 +1355,156 @@ func typeFields(t reflect.Type) []field {
 
 	fields = out
 	sort.Sort(byIndex(fields))
+	log.Printf("fields=[%v]\n", fields)
+
+	return fields
+}
+
+// typeFields returns a list of fields that JSON should recognize for the given type.
+// The algorithm is breadth-first search over the set of structs to include - the top struct
+// and then any reachable anonymous structs.
+func typeFieldsWithValue(_t reflect.Value) []field {
+	t := _t.Type()
+	keySliceV := _t.FieldByName("KeySlice")
+	// Anonymous fields to explore at the current level and the next.
+	current := []field{}
+	next := []field{{typ: t}}
+
+	// Count of queued names for current level and the next.
+	count := map[reflect.Type]int{}
+	nextCount := map[reflect.Type]int{}
+
+	// Types already visited at an earlier level.
+	visited := map[reflect.Type]bool{}
+
+	// Fields found.
+	var fields []field
+
+	for len(next) > 0 {
+		current, next = next, current[:0]
+		count, nextCount = nextCount, map[reflect.Type]int{}
+
+		for _, f := range current {
+			if visited[f.typ] {
+				continue
+			}
+			visited[f.typ] = true
+
+			// Scan f.typ for fields to include.
+			lst := keySliceV.Interface().([]string)
+			for i := 0; i < len(lst); i++ {
+				sf := reflect.TypeOf(lst[i])
+				tag := ""
+				name, opts := parseTag(tag)
+				if !isValidTag(name) {
+					name = ""
+				}
+				index := make([]int, len(f.index)+1)
+				copy(index, f.index)
+				index[len(f.index)] = i
+
+				ft := sf
+				if ft.Name() == "" && ft.Kind() == reflect.Ptr {
+					// Follow pointer.
+					ft = ft.Elem()
+				}
+
+				// Only strings, floats, integers, and booleans can be quoted.
+				quoted := false
+				if opts.Contains("string") {
+					switch ft.Kind() {
+					case reflect.Bool,
+						reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+						reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+						reflect.Float32, reflect.Float64,
+						reflect.String:
+						quoted = true
+					}
+				}
+
+				// Record found field and index sequence.
+				if name != "" || ft.Kind() != reflect.Struct {
+					tagged := name != ""
+					if name == "" {
+						name = lst[i]
+					}
+					fields = append(fields, fillField(field{
+						name:      name,
+						tag:       tagged,
+						index:     index,
+						typ:       ft,
+						omitEmpty: opts.Contains("omitempty"),
+						quoted:    quoted,
+					}))
+					if count[f.typ] > 1 {
+						// If there were multiple instances, add a second,
+						// so that the annihilation code will see a duplicate.
+						// It only cares about the distinction between 1 or 2,
+						// so don't bother generating any more copies.
+						fields = append(fields, fields[len(fields)-1])
+					}
+					continue
+				}
+
+				// Record new anonymous struct to explore in next round.
+				nextCount[ft]++
+				if nextCount[ft] == 1 {
+					next = append(next, fillField(field{name: ft.Name(), index: index, typ: ft}))
+				}
+			}
+		}
+	}
+	//
+	//sort.Slice(fields, func(i, j int) bool {
+	//	x := fields
+	//	// sort field by name, breaking ties with depth, then
+	//	// breaking ties with "name came from json tag", then
+	//	// breaking ties with index sequence.
+	//	if x[i].name != x[j].name {
+	//		return x[i].name < x[j].name
+	//	}
+	//	if len(x[i].index) != len(x[j].index) {
+	//		return len(x[i].index) < len(x[j].index)
+	//	}
+	//	if x[i].tag != x[j].tag {
+	//		return x[i].tag
+	//	}
+	//	return byIndex(x).Less(i, j)
+	//})
+
+	// Delete all fields that are hidden by the Go rules for embedded fields,
+	// except that fields with JSON tags are promoted.
+
+	// The fields are sorted in primary order of name, secondary order
+	// of field index length. Loop over names; for each name, delete
+	// hidden fields by choosing the one dominant field that survives.
+	out := fields[:0]
+	for advance, i := 0, 0; i < len(fields); i += advance {
+		// One iteration per name.
+		// Find the sequence of fields with the name of this first field.
+		fi := fields[i]
+		name := fi.name
+		for advance = 1; i+advance < len(fields); advance++ {
+			fj := fields[i+advance]
+			if fj.name != name {
+				break
+			}
+		}
+		if advance == 1 { // Only one field with this name
+			out = append(out, fi)
+			continue
+		}
+		dominant, ok := dominantField(fields[i : i+advance])
+		if ok {
+			out = append(out, dominant)
+		}
+	}
+
+	fields = out
+	//sort.Sort(byIndex(fields))
+	//log.Printf("fields=[%v]\n", fields)
+
+
 
 	return fields
 }
@@ -1252,6 +1522,7 @@ func dominantField(fields []field) (field, bool) {
 	length := len(fields[0].index)
 	tagged := -1 // Index of first tagged field.
 	for i, f := range fields {
+		log.Printf("fields=[%v]\n", f.name)
 		if len(f.index) > length {
 			fields = fields[:i]
 			break
@@ -1293,6 +1564,34 @@ func cachedTypeFields(t reflect.Type) []field {
 	// Compute fields without lock.
 	// Might duplicate effort but won't hold other computations back.
 	f = typeFields(t)
+	if f == nil {
+		f = []field{}
+	}
+
+	fieldCache.mu.Lock()
+	m, _ = fieldCache.value.Load().(map[reflect.Type][]field)
+	newM := make(map[reflect.Type][]field, len(m)+1)
+	for k, v := range m {
+		newM[k] = v
+	}
+	newM[t] = f
+	fieldCache.value.Store(newM)
+	fieldCache.mu.Unlock()
+	return f
+}
+
+// cachedTypeFields is like typeFields but uses a cache to avoid repeated work.
+func cachedTypeFieldsWithValue(_t reflect.Value) []field {
+	t := _t.Type()
+	m, _ := fieldCache.value.Load().(map[reflect.Type][]field)
+	f := m[t]
+	if f != nil {
+		return f
+	}
+
+	// Compute fields without lock.
+	// Might duplicate effort but won't hold other computations back.
+	f = typeFieldsWithValue(_t)
 	if f == nil {
 		f = []field{}
 	}
