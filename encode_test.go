@@ -924,7 +924,7 @@ func TestEncodeOrderedObject(t *testing.T) {
 func TestMarshal2(t *testing.T) {
 	log.SetFlags(log.Lshortfile | log.LstdFlags)
 	a := SimMap{}
-	err := Unmarshal([]byte(`{"msg":"Success","code":"10000","sub_merchant_id":"2088231448140708"}`), &a)
+	err := Unmarshal([]byte(`{"zzzaaa":"123","sub_merchant_id":"2088231448140708","code":"10000","msg":"Success"}`), &a)
 	fmt.Printf("unmarshal|out=[%v]\nerr=[%v]\n", a, err)
 	out2, err := Marshal(a)
 	fmt.Printf("Marshal|out2=[%v]\nerr=[%v]\n", string(out2), err)
